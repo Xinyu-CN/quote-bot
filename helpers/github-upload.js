@@ -1,10 +1,22 @@
 /**
- * Upload a Buffer (PNG image) to a GitHub repository via the Contents API.
+ * Upload a Buffer (PNG image) to GitHub via cross-repo Pull Request.
+ *
+ * Two-repo model:
+ *   - FORK repo  : bot has push access, temp branches are created here
+ *   - MAIN repo  : protected, only accepts PRs from the fork
+ *
+ * Flow:
+ *   1. Get latest commit SHA of the FORK repo's default branch
+ *   2. Create a temporary branch in the FORK repo
+ *   3. Upload the file to that branch via Contents API
+ *   4. Open a cross-repo Pull Request: fork branch → main repo base branch
+ *   5. Return both the raw image URL (on the fork branch) and the PR URL
  *
  * Requires env vars:
- *   GITHUB_TOKEN  – personal-access-token with `repo` / `contents:write` scope
- *   GITHUB_REPO   – "owner/repo" of the image-hosting repository
- *   GITHUB_BRANCH – (optional) target branch, defaults to "main"
+ *   GITHUB_TOKEN      – personal-access-token with `repo` scope
+ *   GITHUB_FORK_REPO  – "owner/repo" of the fork (bot pushes here)
+ *   GITHUB_MAIN_REPO  – "owner/repo" of the upstream/main repo (PR target)
+ *   GITHUB_BRANCH     – (optional) base branch on the MAIN repo, defaults to "main"
  */
 
 const GITHUB_API = 'https://api.github.com'
@@ -12,62 +24,109 @@ const GITHUB_API = 'https://api.github.com'
 /**
  * @param {Buffer}  imageBuffer  – PNG image data
  * @param {string}  filePath     – destination inside the repo, e.g. "john/hello.png"
- * @returns {Promise<string>}    – raw.githubusercontent URL of the uploaded file
+ * @returns {Promise<{ rawUrl: string, prUrl: string }>}
  */
 async function uploadToGitHub (imageBuffer, filePath) {
   const token = process.env.GITHUB_TOKEN
-  const repo = process.env.GITHUB_REPO // e.g. "myorg/quote-images"
-  const branch = process.env.GITHUB_BRANCH || 'main'
+  const forkRepo = process.env.GITHUB_FORK_REPO   // e.g. "bot-user/quote-images"
+  const mainRepo = process.env.GITHUB_MAIN_REPO   // e.g. "myorg/quote-images"
+  const baseBranch = process.env.GITHUB_BRANCH || 'main'
 
-  if (!token || !repo) {
-    throw new Error('GITHUB_TOKEN or GITHUB_REPO is not configured')
+  if (!token || !forkRepo || !mainRepo) {
+    throw new Error('GITHUB_TOKEN, GITHUB_FORK_REPO, or GITHUB_MAIN_REPO is not configured')
   }
 
-  const apiUrl = `${GITHUB_API}/repos/${repo}/contents/${filePath}`
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    Accept: 'application/vnd.github+json',
+    'Content-Type': 'application/json'
+  }
 
-  // Check whether the file already exists (we need its sha to overwrite)
-  let existingSha
-  try {
-    const check = await fetch(apiUrl, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: 'application/vnd.github+json'
-      }
-    })
-    if (check.ok) {
-      const json = await check.json()
-      existingSha = json.sha
+  // ── Step 1: Get the latest commit SHA of the fork's base branch ───────
+  // If the fork's base branch doesn't exist yet, sync from main repo first.
+  let baseSha
+  const forkRefRes = await fetch(
+    `${GITHUB_API}/repos/${forkRepo}/git/ref/heads/${baseBranch}`,
+    { headers }
+  )
+  if (forkRefRes.ok) {
+    const forkRefData = await forkRefRes.json()
+    baseSha = forkRefData.object.sha
+  } else {
+    // Fallback: get SHA from main repo and create the branch in fork
+    const mainRefRes = await fetch(
+      `${GITHUB_API}/repos/${mainRepo}/git/ref/heads/${baseBranch}`,
+      { headers }
+    )
+    if (!mainRefRes.ok) {
+      throw new Error(`Failed to get base branch ref from main repo (${mainRefRes.status})`)
     }
-  } catch (_) {
-    // file does not exist yet – that's fine
+    const mainRefData = await mainRefRes.json()
+    baseSha = mainRefData.object.sha
   }
 
-  const body = {
-    message: `upload ${filePath}`,
-    content: imageBuffer.toString('base64'),
-    branch
+  // ── Step 2: Create a temporary branch in the FORK repo ────────────────
+  const tempBranch = `hub/${filePath.replace(/\.png$/, '')}-${Date.now()}`
+  const createBranchRes = await fetch(
+    `${GITHUB_API}/repos/${forkRepo}/git/refs`,
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        ref: `refs/heads/${tempBranch}`,
+        sha: baseSha
+      })
+    }
+  )
+  if (!createBranchRes.ok) {
+    const text = await createBranchRes.text()
+    throw new Error(`Failed to create branch in fork (${createBranchRes.status}): ${text}`)
   }
-  if (existingSha) body.sha = existingSha
 
-  const res = await fetch(apiUrl, {
+  // ── Step 3: Upload the file to the temp branch in the FORK repo ───────
+  const contentUrl = `${GITHUB_API}/repos/${forkRepo}/contents/${filePath}`
+  const uploadRes = await fetch(contentUrl, {
     method: 'PUT',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: 'application/vnd.github+json',
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(body)
+    headers,
+    body: JSON.stringify({
+      message: `upload ${filePath}`,
+      content: imageBuffer.toString('base64'),
+      branch: tempBranch
+    })
   })
-
-  if (!res.ok) {
-    const text = await res.text()
-    throw new Error(`GitHub upload failed (${res.status}): ${text}`)
+  if (!uploadRes.ok) {
+    const text = await uploadRes.text()
+    throw new Error(`Failed to upload file to fork (${uploadRes.status}): ${text}`)
   }
+  const uploadData = await uploadRes.json()
+  const rawUrl = uploadData.content.download_url
 
-  const data = await res.json()
+  // ── Step 4: Create a cross-repo Pull Request (fork → main) ────────────
+  // head format for cross-repo PR: "<fork-owner>:<branch>"
+  const forkOwner = forkRepo.split('/')[0]
+  const prRes = await fetch(
+    `${GITHUB_API}/repos/${mainRepo}/pulls`,
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        title: `[Quote Hub] ${filePath}`,
+        body: `Auto-generated by Quote Bot.\n\n![preview](${rawUrl})`,
+        head: `${forkOwner}:${tempBranch}`,
+        base: baseBranch
+      })
+    }
+  )
+  if (!prRes.ok) {
+    const text = await prRes.text()
+    throw new Error(`Failed to create PR (${prRes.status}): ${text}`)
+  }
+  const prData = await prRes.json()
 
-  // Return the raw URL for direct browser access
-  return data.content.download_url
+  return {
+    rawUrl,
+    prUrl: prData.html_url
+  }
 }
 
 module.exports = { uploadToGitHub }
