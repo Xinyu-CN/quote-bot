@@ -24,6 +24,7 @@ const openai = new OpenAI({
 })
 
 const { sendGramadsAd } = require('../helpers/gramads')
+const { uploadToGitHub } = require('../helpers/github-upload')
 
 // Config will be loaded asynchronously through context
 let config = null
@@ -69,12 +70,12 @@ async function startClearStickerPack(stickerConfig = null) {
 
     isRunning = true
     try {
-      if (!botInfo) botInfo = await telegram.getMe()
+      if (!botInfo) botInfo = awt telegram.getMe()
 
       const configToUse = stickerConfig || config || { globalStickerSet: { save_sticker_count: 10, name: 'default' } }
 
       // Add timeout to prevent hanging
-      const stickerSet = await Promise.race([
+      const stickerSet = awt Promise.race([
         telegram.getStickerSet(configToUse.globalStickerSet.name + botInfo.username),
         new Promise((_, reject) => setTimeout(() => reject(new Error('getStickerSet timeout')), 10000))
       ]).catch((error) => {
@@ -90,7 +91,7 @@ async function startClearStickerPack(stickerConfig = null) {
       const maxConcurrent = 3
       for (let i = 0; i < stickersToDelete.length; i += maxConcurrent) {
         const batch = stickersToDelete.slice(i, i + maxConcurrent)
-        await Promise.allSettled(
+        awt Promise.allSettled(
           batch.map(sticker =>
             Promise.race([
               telegram.deleteStickerFromSet(sticker.file_id),
@@ -271,7 +272,7 @@ const handleQuoteError = async (ctx, error) => {
 module.exports = async (ctx, next) => {
   // Use config from context if available, fallback to local config
   const currentConfig = ctx.config || config || { globalStickerSet: { save_sticker_count: 10, name: 'default' } }
-  const flag = {
+const flag = {
     count: false,
     reply: false,
     png: false,
@@ -284,7 +285,9 @@ module.exports = async (ctx, next) => {
     ai: false,
     html: false,
     aiQuery: false,
-  }
+    hub: false,
+    hubFilename: false,
+   }
 
   const isCommand = ctx.message.text ? ctx.message.text.match(/\/q/) : false
 
@@ -305,6 +308,19 @@ module.exports = async (ctx, next) => {
     flag.ai = args.find((arg) => ['*'].includes(arg))
     flag.html = args.find((arg) => ['h', 'html'].includes(arg))
     flag.stories = args.find((arg) => ['s', 'stories'].includes(arg))
+
+    // Parse hub flag: /q hub <filename>
+    const hubIndex = args.findIndex((arg) => arg === 'hub')
+    if (hubIndex !== -1) {
+      flag.hub = true
+      flag.png = true // hub always produces a PNG
+      // The next argument after "hub" is the filename
+      if (args[hubIndex + 1] && !['r', 'reply', 'p', 'png', 'i', 'img', 'rate', 'h', 'hidden', 'm', 'media', 'c', 'crop', '*', 'html', 's', 'stories'].includes(args[hubIndex + 1])) {
+        flag.hubFilename = args[hubIndex + 1].replace(/[^a-zA-Z0-9_\-]/g, '_') // sanitize
+      } else {
+        flag.hubFilename = `quote_${Date.now()}`
+      }
+    }
 
     // Check if this is an AI query (text without reply that's not just flags/colors)
     if (fullQuery && !ctx.message.reply_to_message && fullQuery.length > 2) {
@@ -1204,18 +1220,45 @@ ${JSON.stringify(messageForAIContext)}
         })
       } else {
         try {
-          await ctx.replyWithDocument({
-            source: image,
-            filename: 'quote.png'
-          }, {
-            reply_to_message_id: ctx.message.message_id,
-            allow_sending_without_reply: true,
-            business_connection_id: ctx.update?.business_message?.business_connection_id
-          })
+         await ctx.replyWithDocument({
+          source: image,
+          filename: 'quote.png'
+         }, {
+          reply_to_message_id: ctx.message.message_id,
+          allow_sending_without_reply: true,
+          business_connection_id: ctx.update?.business_message?.business_connection_id
+         })
+
+         // --- hub: upload PNG to GitHub and send the URL ---
+         if (flag.hub) {
+          try {
+           const username = (ctx.from.username || `user_${ctx.from.id}`).toLowerCase()
+           const ghPath = `${username}/${flag.hubFilename}.png`
+           const rawUrl = await uploadToGitHub(image, ghPath)
+           await ctx.replyWithHTML(
+            `<b>Uploaded to Hub</b>\n<a href="${rawUrl}">${ghPath}</a>`,
+            {
+             reply_to_message_id: ctx.message.message_id,
+             allow_sending_without_reply: true,
+             disable_web_page_preview: true
+            }
+           )
+          } catch (hubError) {
+           console.error('GitHub hub upload error:', hubError)
+           await ctx.replyWithHTML(
+            `<b>Hub upload failed:</b> ${hubError.message}`,
+            {
+             reply_to_message_id: ctx.message.message_id,
+             allow_sending_without_reply: true
+            }
+           )
+          }
+         }
+
         } catch (error) {
-          return handleQuoteError(ctx, error)
+         return handleQuoteError(ctx, error)
         }
-      }
+       }
     } catch (error) {
       return handleQuoteError(ctx, error)
     } finally {
